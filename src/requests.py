@@ -1,3 +1,4 @@
+import re
 import ssl
 import gzip
 import json
@@ -17,6 +18,19 @@ class HTTPException(Exception):
 
 class RateLimitException(HTTPException):
     pass
+
+class ListItemStaleException(HTTPException):
+    """Raised on a CF 400 'item to be removed, X, not found in list'. The
+    cache thinks list X still contains items Cloudflare has already dropped
+    (cache↔CF drift from a cancelled mid-write run). CF rejects the *whole*
+    PATCH atomically. Recoverable — update_list drops the named item(s) from
+    `remove` and re-sends. `.items` holds the names."""
+    def __init__(self, message, items):
+        super().__init__(message)
+        self.items = items
+
+# CF reports one offending item per 400; findall future-proofs multi-item bodies.
+_stale_remove_pattern = re.compile(r"item to be removed,\s*(.+?),\s*not found in list")
 
 def cloudflare_gateway_request(
     method: str, endpoint: str,
@@ -63,6 +77,14 @@ def cloudflare_gateway_request(
                 silent_error(error_message)
                 raise RateLimitException(error_message)
             elif status in [400, 403, 404]:
+                stale = _stale_remove_pattern.findall(
+                    data.decode('utf-8', errors='ignore')
+                )
+                if stale:
+                    # Recoverable cache↔CF drift — let update_list drop these
+                    # and retry instead of exiting the run.
+                    silent_error(error_message)
+                    raise ListItemStaleException(error_message, stale)
                 error(error_message)
             else:
                 silent_error(error_message)
